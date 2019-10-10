@@ -17,10 +17,10 @@ func TestTrie(t *testing.T) {
 		for j := 0; j < 8; j++ {
 			word[j] = rand.Int31n(25) + 97
 		}
-		tr.Add(word)
+		tr.Set(word)
 	}
-	tr.Add([]rune("mother"))
-	tr.Add([]rune("father"))
+	tr.Set([]rune("mother"))
+	tr.Set([]rune("father"))
 
 	hasMother := tr.Has([]rune("mother"))
 	hasFather := tr.Has([]rune("father"))
