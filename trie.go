@@ -1,20 +1,23 @@
-package go_trie
+package trie
 
 import (
 	"errors"
 	"math/bits"
+	"sync"
+	"unicode/utf8"
 )
 
 // Trie works with latin characters, space and digits
 type Trie struct {
+	sync.RWMutex
 	characters uint64
 	subTries   []*Trie
 	data       interface{}
 }
 
 func (trie *Trie) Set(key string, value interface{}) error {
-	if key == "" {
-		return errors.New("key cannot be empty")
+	if err := trie.checkKey(key); err != nil {
+		return err
 	}
 
 	if value == nil {
@@ -23,56 +26,68 @@ func (trie *Trie) Set(key string, value interface{}) error {
 
 	tr := trie
 	for _, char := range key {
-		bitNum, subTrieId, subTrie, err := tr.getSubTrie(char)
+		tr.Lock()
+		bitNum, subTrieId, subTrie := tr.getSubTrie(char)
 
-		if err != nil {
-			return err
+		if subTrie != nil {
+			tr.Unlock()
+			tr = subTrie
+			continue
 		}
 
-		if subTrie == nil {
-			subTrie = &Trie{}
-			tr.characters = tr.characters | (1 << bitNum)
-			tr.subTries = append(tr.subTries, nil)
-			copy(tr.subTries[subTrieId+1:], tr.subTries[subTrieId:])
-			tr.subTries[subTrieId] = subTrie
-		}
-
+		subTrie = &Trie{}
+		tr.characters |= 1 << bitNum
+		tr.subTries = append(tr.subTries, nil)
+		copy(tr.subTries[subTrieId+1:], tr.subTries[subTrieId:])
+		tr.subTries[subTrieId] = subTrie
+		tr.Unlock()
 		tr = subTrie
 	}
+
+	tr.Lock()
 	tr.data = value
+	tr.Unlock()
 
 	return nil
 }
 
 // Find an item having exact given key
 func (trie *Trie) Get(key string) (interface{}, error) {
+	if err := trie.checkKey(key); err != nil {
+		return nil, err
+	}
+
 	tr := trie
 	for _, char := range key {
-		_, _, subTrie, err := tr.getSubTrie(char)
-
-		if err != nil {
-			return nil, err
-		}
+		tr.RLock()
+		_, _, subTrie := tr.getSubTrie(char)
+		tr.RUnlock()
 
 		if subTrie == nil {
 			return nil, nil
 		}
+
 		tr = subTrie
 	}
 
-	return tr.data, nil
+	tr.RLock()
+	ret := tr.data
+	tr.RUnlock()
+
+	return ret, nil
 }
 
 type TraverseNode struct {
-	key string
+	key  string
 	trie *Trie
 }
 
 func (tn *TraverseNode) getChildren() []*TraverseNode {
 	trie := tn.trie
+	trie.RLock()
 	ret, i := make([]*TraverseNode, len(trie.subTries)), 0
 	for bitNum := int32(0); bitNum < 64; bitNum++ {
-		if trie.characters & (1<<bitNum) == 0 {
+		if trie.characters&(1<<bitNum) == 0 {
 			continue
 		}
 
@@ -84,19 +99,20 @@ func (tn *TraverseNode) getChildren() []*TraverseNode {
 			break
 		}
 	}
+	trie.RUnlock()
 
 	return ret
 }
 
 type DataForKey struct {
-	Key string
+	Key  string
 	Data interface{}
 }
 
 // Find items having given prefix
 func (trie *Trie) GetByPrefix(prefix string, limit int) ([]DataForKey, error) {
-	if prefix == "" {
-		return nil, nil
+	if err := trie.checkKey(prefix); err != nil {
+		return nil, err
 	}
 
 	if limit <= 0 {
@@ -106,11 +122,9 @@ func (trie *Trie) GetByPrefix(prefix string, limit int) ([]DataForKey, error) {
 	tr := trie
 	var ret []DataForKey
 	for _, char := range prefix {
-		_, _, subTrie, err := tr.getSubTrie(char)
-
-		if err != nil {
-			return nil, err
-		}
+		tr.RLock()
+		_, _, subTrie := tr.getSubTrie(char)
+		tr.RUnlock()
 
 		if subTrie == nil {
 			return nil, nil
@@ -119,6 +133,7 @@ func (trie *Trie) GetByPrefix(prefix string, limit int) ([]DataForKey, error) {
 		tr = subTrie
 	}
 
+	tr.RLock()
 	if tr.data != nil {
 		ret = append(ret, DataForKey{Key: prefix, Data: tr.data})
 
@@ -126,6 +141,7 @@ func (trie *Trie) GetByPrefix(prefix string, limit int) ([]DataForKey, error) {
 			limit--
 		}
 	}
+	tr.RUnlock()
 
 	var toTraverse []*TraverseNode
 	toTraverse = append(toTraverse, &TraverseNode{key: prefix, trie: tr})
@@ -133,90 +149,100 @@ func (trie *Trie) GetByPrefix(prefix string, limit int) ([]DataForKey, error) {
 		toTr := toTraverse[0]
 		items, added := toTr.getChildren(), 0
 		for _, item := range items {
+			item.trie.RLock()
 			if item.trie.data != nil {
 				ret = append(ret, DataForKey{Key: item.key, Data: item.trie.data})
 				added++
+				limit--
 			}
+			item.trie.RUnlock()
 		}
-		limit -= added
 
 		toTraverse = append(toTraverse, items...)
-		toTraverse = toTraverse[1:]
+
+		if len(toTraverse) > 0 {
+			toTraverse = toTraverse[1:]
+		} else {
+			break
+		}
 	}
 
 	return ret, nil
 }
 
 func (trie *Trie) Remove(key string) error {
-	if key == "" {
-		return nil
+	if err := trie.checkKey(key); err != nil {
+		return err
 	}
 
-	type ToRemove struct {
-		root *Trie
-		bitNum uint64
-		subTrueId int
-	}
-
-	var removeList []ToRemove
-	tr := trie
-	for _, char := range key {
-		bitNum, subTrieId, subTrie, err := tr.getSubTrie(char)
-
-		if err != nil {
-			return err
+	toRemove, tr := make([]*Trie, 0, utf8.RuneCountInString(key)), trie
+	lastIndex := utf8.RuneCountInString(key) - 1
+	var rootChar rune
+	for index, char := range key {
+		if len(toRemove) == 0 {
+			tr.Lock()
+			rootChar = char
 		}
 
-		if bits.OnesCount64(subTrie.characters) <= 1 {
-			removeList = append(removeList, ToRemove{root: tr, bitNum: bitNum, subTrueId: subTrieId})
-		} else {
-			removeList = removeList[:0]
+		toRemove = append(toRemove, tr)
+		_, _, subTrie := tr.getSubTrie(char)
+
+		if subTrie == nil {
+			toRemove[0].Unlock()
+			return nil
 		}
+
+		subTrie.RLock()
+		if len(subTrie.subTries) > 1 || subTrie.data != nil || index == lastIndex && len(subTrie.subTries) > 0 {
+			toRemove[0].Unlock()
+			toRemove = toRemove[:0]
+		}
+		subTrie.RUnlock()
 		tr = subTrie
 	}
 
+	tr.Lock()
 	tr.data = nil
+	tr.Unlock()
 
-	if bits.OnesCount64(tr.characters) > 0 {
+	if len(toRemove) == 0 {
 		return nil
 	}
 
-	for i := len(removeList)-1; i >= 0; i-- {
-		toRem := removeList[i]
-		toRem.root.characters = toRem.root.characters & (0<<toRem.bitNum)
-		subCount := len(toRem.root.subTries)
-
-		if subCount == 1 {
-			toRem.root.subTries = toRem.root.subTries[:0]
-			continue
-		}
-
-		copy(toRem.root.subTries[:toRem.subTrueId], toRem.root.subTries[:toRem.subTrueId+1])
-		toRem.root.subTries = toRem.root.subTries[:subCount-1]
+	for i := len(toRemove) - 1; i > 0; i-- {
+		toRemove[i].characters, toRemove[i].subTries = 0, nil
 	}
+
+	tr = toRemove[0]
+	bitNum, subTrieId, _ := tr.getSubTrie(rootChar)
+	if len(tr.subTries) == 1 {
+		tr.subTries = nil
+		tr.characters = 0
+	} else {
+		tr.subTries = append(tr.subTries[:subTrieId], tr.subTries[subTrieId+1:]...)
+		mask := uint64(^(1<<bitNum))
+		tr.characters &= mask
+	}
+	tr.Unlock()
 
 	return nil
 }
 
-func (trie *Trie) getSubTrie(char rune) (uint64, int, *Trie, error) {
-	bitNum, ok := calcBitNum(char)
-
-	if !ok {
-		return 0, 0, nil, errors.New("trie key can contain only a-z, A-Z, 0-9 characters and space")
-	}
+func (trie *Trie) getSubTrie(char rune) (uint64, int, *Trie) {
+	bitNum, _ := calcBitNum(char)
+	subTrieId := trie.getSubTreeIndex(bitNum)
 
 	// There is no subTrie under given character since the corresponding bit is zero
-	if trie.characters & (1<<bitNum) == 0 {
-		return 0, 0, nil, nil
+	if trie.characters&(1<<bitNum) == 0 {
+		return bitNum, subTrieId, nil
 	}
 
-	subTrieId := trie.getSubTreeIndex(bitNum)
-	return bitNum, subTrieId, trie.subTries[subTrieId], nil
+	return bitNum, subTrieId, trie.subTries[subTrieId]
 }
 
 // subTreeIndex is an amount of bits before bitNum
 func (trie *Trie) getSubTreeIndex(bitNum uint64) int {
-	shifted := uint64(trie.characters << (64 - bitNum))
+	shifted := trie.characters << (64 - bitNum)
 	return bits.OnesCount64(shifted)
 }
 
@@ -259,4 +285,18 @@ func calcRune(bitNum int32) rune {
 	}
 
 	return 32
+}
+
+func (trie *Trie) checkKey(key string) error {
+	if key == "" {
+		return errors.New("key cannot be empty")
+	}
+
+	for _, char := range key {
+		if _, ok := calcBitNum(char); !ok {
+			return errors.New("key can contain only a-z, A-Z characters, digits and space")
+		}
+	}
+
+	return nil
 }
